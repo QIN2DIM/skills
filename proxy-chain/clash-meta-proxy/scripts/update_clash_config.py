@@ -23,8 +23,10 @@ Clash-Meta 配置自动更新脚本
 
 import shutil
 import sys
+import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 try:
     import yaml
@@ -38,9 +40,17 @@ CONFIG_FILE = WORK_DIR / "config.yaml"
 PROXIES_FILE = WORK_DIR / ".proxies.yaml"
 BACKUP_FILE = WORK_DIR / "config.yaml.bak"
 EDITING_FILE = WORK_DIR / "config.yaml.editing"
+DISABLED_PROXY_MARKER = "__AUTO_DISABLED__::"
+BUILTIN_PROXY_REFS = {
+    "DIRECT",
+    "REJECT",
+    "REJECT-DROP",
+    "PASS",
+    "COMPATIBLE",
+}
 
 
-def load_yaml(path: Path) -> dict:
+def load_yaml(path: Path) -> Dict[str, Any]:
     """安全加载 YAML 文件"""
     if not path.exists():
         raise FileNotFoundError(f"文件不存在: {path}")
@@ -49,7 +59,7 @@ def load_yaml(path: Path) -> dict:
     return yaml.safe_load(content) or {}
 
 
-def save_yaml(data: dict, path: Path) -> None:
+def save_yaml(data: Dict[str, Any], path: Path) -> None:
     """保存 YAML 文件，保留格式"""
     yaml.add_representer(
         type(None),
@@ -81,38 +91,102 @@ def backup_config() -> None:
     print(f"✓ 编辑文件: {EDITING_FILE.name}")
 
 
-def update_proxies(config: dict, new_proxies: list) -> dict:
+def update_proxies(config: Dict[str, Any], new_proxies: List[Dict[str, Any]]) -> Dict[str, Any]:
     """用新代理列表覆盖 config 中的 proxies"""
-    old_count = len(config.get('proxies', []))
+    old_proxies = config.get('proxies', []) or []
+    old_count = len(old_proxies)
     new_count = len(new_proxies)
-    
+
+    # 打印新增和移除的节点名（在覆盖前计算旧集合）
+    old_names = {p.get('name') for p in old_proxies if isinstance(p, dict) and p.get('name')}
+    new_names = {p.get('name') for p in new_proxies if isinstance(p, dict) and p.get('name')}
+
     config['proxies'] = new_proxies
-    
+
     print(f"\n✓ Proxies 已更新: {old_count} -> {new_count} 个节点")
-    # 打印新增和移除的节点名
-    old_names = {p.get('name') for p in (config.get('proxies') or [])}
-    new_names = {p.get('name') for p in new_proxies}
     
     added = new_names - old_names
     removed = old_names - new_names
     
     if added:
-        print(f"  + 新增: {', '.join(added)}")
+        print(f"  + 新增: {', '.join(sorted(added))}")
     if removed:
-        print(f"  - 移除: {', '.join(removed)}")
+        print(f"  - 移除: {', '.join(sorted(removed))}")
     
     return config
 
 
-def review_proxy_groups(config: dict) -> tuple[dict, list]:
+def _extract_disabled_proxy_name(proxy_ref: str) -> str:
+    """从历史伪注释字符串中尽量提取原始节点名"""
+    text = proxy_ref.strip()
+    if not text.startswith("#"):
+        return text
+
+    body = text[1:].strip()
+    if "# [AUTO] 节点已失效" in body:
+        body = body.split("# [AUTO] 节点已失效", 1)[0].rstrip()
+    return body
+
+
+def materialize_disabled_proxy_comments(path: Path) -> int:
+    """
+    将标记字符串转换为 YAML 真实注释行:
+      - "__AUTO_DISABLED__::node-a"
+    =>
+      # - node-a  # [AUTO] 节点已失效
+    """
+    lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+    converted = 0
+    output_lines = []
+
+    for raw_line in lines:
+        line = raw_line.rstrip('\r\n')
+        newline = raw_line[len(line):]
+
+        match = re.match(r"^(\s*)-\s*(.+?)\s*$", line)
+        if not match:
+            output_lines.append(raw_line)
+            continue
+
+        indent, scalar_src = match.group(1), match.group(2)
+        if DISABLED_PROXY_MARKER not in scalar_src:
+            output_lines.append(raw_line)
+            continue
+
+        try:
+            scalar_val = yaml.safe_load(scalar_src)
+        except Exception:
+            output_lines.append(raw_line)
+            continue
+
+        if isinstance(scalar_val, str) and scalar_val.startswith(DISABLED_PROXY_MARKER):
+            proxy_name = scalar_val[len(DISABLED_PROXY_MARKER):]
+            output_lines.append(f"{indent}# - {proxy_name}  # [AUTO] 节点已失效{newline or chr(10)}")
+            converted += 1
+        else:
+            output_lines.append(raw_line)
+
+    if converted:
+        path.write_text(''.join(output_lines), encoding='utf-8')
+
+    return converted
+
+
+def review_proxy_groups(config: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     核验 proxy-groups，返回更新后的 config 和变更记录
     
     对于每个 proxy-groups[*].proxies 中的 name:
-    - 如果不在 proxies 列表中，则注释掉（添加 # 前缀）
+    - 如果既不在 proxies 列表，也不在 proxy-groups 名称列表中，则标记为待注释
     """
     proxy_names = {p.get('name') for p in config.get('proxies', []) if p.get('name')}
     proxy_groups = config.get('proxy-groups', [])
+    group_names = {
+        g.get('name')
+        for g in proxy_groups
+        if isinstance(g, dict) and isinstance(g.get('name'), str) and g.get('name').strip()
+    }
+    valid_refs = proxy_names | group_names | BUILTIN_PROXY_REFS
     
     changed_groups = []
     
@@ -131,17 +205,17 @@ def review_proxy_groups(config: dict) -> tuple[dict, list]:
                 new_proxies.append(proxy_ref)
                 continue
                 
-            # 检查是否已注释
-            is_commented = proxy_ref.strip().startswith('#')
-            proxy_name = proxy_ref.lstrip('#').strip()
-            
-            if is_commented:
-                # 保持注释状态
-                new_proxies.append(proxy_ref)
-            elif proxy_name not in proxy_names:
-                # 失效代理，添加注释
-                commented = f"# {proxy_ref}  # [AUTO] 节点已失效"
-                new_proxies.append(commented)
+            # 兼容历史版本写入的“伪注释字符串”
+            if proxy_ref.strip().startswith('#'):
+                proxy_name = _extract_disabled_proxy_name(proxy_ref)
+                new_proxies.append(f"{DISABLED_PROXY_MARKER}{proxy_name}")
+                group_changes.append(f"- {proxy_name}")
+                continue
+
+            proxy_name = proxy_ref.strip()
+            if proxy_name not in valid_refs:
+                # 失效代理，写入占位标记，保存后再转为真实 YAML 注释
+                new_proxies.append(f"{DISABLED_PROXY_MARKER}{proxy_ref}")
                 group_changes.append(f"- {proxy_name}")
             else:
                 new_proxies.append(proxy_ref)
@@ -234,7 +308,10 @@ def main():
     
     # 保存编辑后的配置
     save_yaml(config, EDITING_FILE)
+    converted_comments = materialize_disabled_proxy_comments(EDITING_FILE)
     print(f"\n✓ 已保存: {EDITING_FILE}")
+    if converted_comments:
+        print(f"✓ 已注释失效节点: {converted_comments} 条")
     
     # 5. 生成 diff
     print("\n" + "=" * 60)
