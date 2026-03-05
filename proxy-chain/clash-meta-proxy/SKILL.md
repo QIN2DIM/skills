@@ -1,6 +1,6 @@
 ---
-name: clash-meta-config-update
-description: Update clash-meta proxy configuration. Use when updating proxy nodes for clash-meta service, editing `config.yaml` with new proxies from `.proxies.yaml`, or maintaining proxy-groups consistency. Use the provided Python script with uv for automated backup, proxy update, and proxy-groups review.
+name: clash-meta-proxy
+description: Update clash-meta proxy configuration. Use when updating proxy nodes for clash-meta service, editing config.yaml with new proxies from .proxies.yaml, or maintaining proxy-groups consistency. Use the provided Python script with uv for automated backup, proxy update, and proxy-groups review.
 ---
 
 # Clash-Meta 配置更新
@@ -9,7 +9,7 @@ description: Update clash-meta proxy configuration. Use when updating proxy node
 
 ## 环境信息
 
-- **工作目录**: `./`
+- **默认工作目录**: `./`
 - **现配置文件**: `config.yaml`
 - **新代理配置**: `.proxies.yaml`
 
@@ -22,12 +22,12 @@ description: Update clash-meta proxy configuration. Use when updating proxy node
 **方式一：直接运行（推荐）**
 ```bash
 # In the work_dir
-uv run .agents/skills/clash-meta-config-update/scripts/update_clash_config.py
+uv run scripts/update_clash_config.py
 ```
 
 **方式二：指定工作目录运行**
 ```bash
-uv run --cwd ./ .agents/skills/clash-meta-config-update/scripts/update_clash_config.py
+uv run --cwd ./ scripts/update_clash_config.py
 ```
 
 脚本自动完成：
